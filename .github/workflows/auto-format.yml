@@ -1,0 +1,118 @@
+name: auto-format
+
+# Formatting is a scheduled maintenance pass, never a required merge check.
+# The last-success SHA bounds each pass to new changes and prevents loops.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: auto-format-main
+  cancel-in-progress: false
+
+jobs:
+  prettier:
+    name: Prettier auto-format
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+
+      - name: Format changed files and commit fixes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LAST_SUCCESS_SHA: ${{ vars.AUTO_FORMAT_LAST_SUCCESS_SHA }}
+        run: |
+          set -euo pipefail
+          record_success() {
+            local sha
+            sha="$(git rev-parse HEAD)"
+            if gh api -X PATCH "repos/$GITHUB_REPOSITORY/actions/variables/AUTO_FORMAT_LAST_SUCCESS_SHA" -f name="AUTO_FORMAT_LAST_SUCCESS_SHA" -f value="$sha" >/dev/null 2>&1; then
+              echo "Recorded AUTO_FORMAT_LAST_SUCCESS_SHA=$sha"
+            elif gh api -X POST "repos/$GITHUB_REPOSITORY/actions/variables" -f name="AUTO_FORMAT_LAST_SUCCESS_SHA" -f value="$sha" >/dev/null 2>&1; then
+              echo "Created AUTO_FORMAT_LAST_SUCCESS_SHA=$sha"
+            else
+              echo "::warning::Could not update the success marker; the next pass will re-check this range."
+            fi
+          }
+
+          changed_file="$(mktemp)"
+          trap 'rm -f "$changed_file"' EXIT
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          for attempt in 1 2 3; do
+            git fetch origin main
+            git reset --hard origin/main
+            head_sha="$(git rev-parse HEAD)"
+            if [[ -n "${LAST_SUCCESS_SHA:-}" && "$LAST_SUCCESS_SHA" == "$head_sha" ]]; then
+              echo "main is unchanged since the last successful format pass ($head_sha)."
+              exit 0
+            fi
+
+            : > "$changed_file"
+            if [[ -n "${LAST_SUCCESS_SHA:-}" ]] \
+              && git cat-file -e "${LAST_SUCCESS_SHA}^{commit}" 2>/dev/null \
+              && git merge-base --is-ancestor "$LAST_SUCCESS_SHA" HEAD; then
+              git diff --name-only --diff-filter=ACMR "$LAST_SUCCESS_SHA...$head_sha" > "$changed_file"
+            else
+              git log --since="25 hours ago" --pretty=format: --name-only \
+                | sort -u \
+                | while IFS= read -r file; do
+                    [[ -n "$file" && -f "$file" ]] && printf '%s\n' "$file"
+                  done > "$changed_file"
+            fi
+
+            mapfile -t changed_files < "$changed_file"
+            if ((${#changed_files[@]} == 0)); then
+              echo "No changed files to format."
+              record_success
+              exit 0
+            fi
+
+            format_files=()
+            for file in "${changed_files[@]}"; do
+              case "$file" in
+                *.ts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.json|*.jsonc|*.md|*.yml|*.yaml|*.css|*.html)
+                  format_files+=("$file")
+                  ;;
+              esac
+            done
+            if ((${#format_files[@]} == 0)); then
+              echo "No changed files are supported by Prettier."
+              record_success
+              exit 0
+            fi
+
+            npx --yes prettier@3.6.2 --write -- "${format_files[@]}"
+            git add -u
+            if git diff --cached --quiet; then
+              echo "Prettier made no changes."
+              record_success
+              exit 0
+            fi
+
+            git commit -m "style(prettier): auto-format on main"
+            if git push origin HEAD:main; then
+              echo "Pushed auto-format commit."
+              record_success
+              exit 0
+            fi
+
+            git fetch origin main
+            main_sha="$(git rev-parse origin/main)"
+            if [[ "$main_sha" == "$head_sha" ]]; then
+              echo "::error::Auto-format push failed and main did not advance."
+              exit 1
+            fi
+            echo "main advanced during formatting ($head_sha -> $main_sha); retrying ($attempt/3)."
+          done
+          echo "::error::main kept advancing during all three format passes."
+          exit 75
